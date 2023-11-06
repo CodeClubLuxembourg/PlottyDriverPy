@@ -9,6 +9,18 @@ import time
 import sys
 import json
 import socketio
+import requests
+
+gondola = False
+f = open( "/var/mode", "r" )
+mode = f.read()
+f.close()
+if mode.strip()=="gondola":
+    gondola = True
+gondola_calibration_length = 111.3
+gondola_steps_per_cm = 402
+gondola_reserve_margin = 20.0 # units
+gondola_max_travel = 1.0 # units
 
 stepper_bottom_enable = 26
 stepper_bottom_step = 19
@@ -28,7 +40,7 @@ limit_switch_left = 3
 limit_switch_right = 2
 
 servo = 23
-pen_up_or_down = False # True for down, False for up
+pen_up_or_down = True # True for down, False for up
 cw = True
 ccw = False
 current_x = False
@@ -38,6 +50,7 @@ canvas_max_y_steps = 0
 canvas_max_x = False
 canvas_max_y = False
 rotate_to_maximize_drawing = False # we now do this on the front end
+get_out_of_the_way_after_draw = False
 
 pen_down_pulse_width_default = 500
 pen_up_pulse_width_default = 1100
@@ -46,11 +59,21 @@ pen_up_action_time_default = 300 # milliseconds
 pen_down_sleep_before_move_time_default = 150 # milliseconds
 pen_up_sleep_before_move_time_default = 0 # milliseconds
 default_step_sleep_default = 0.0002
+if gondola:
+    default_step_sleep_default = 0.0016
 # TODO need to figure out how to change acceleration based on angle
 acceleration_steps_default = 100 # 100
+if gondola:
+    acceleration_steps_default = 160
 deceleration_steps_default = 20 # 20
+if gondola:
+    deceleration_steps_default = 80
 acceleration_slow_steps_sleep_default = 0.0005
+if gondola:
+    acceleration_slow_steps_sleep_default = 0.004
 acceleration_fast_steps_sleep_default = 0.0002
+if gondola:
+    acceleration_fast_steps_sleep_default = 0.0018
 
 pen_down_pulse_width = pen_down_pulse_width_default
 pen_up_pulse_width = pen_up_pulse_width_default
@@ -102,9 +125,11 @@ GPIO.setup( servo, GPIO.OUT )
 pwm = pigpio.pi()
 pwm.set_mode( servo, pigpio.OUTPUT )
 pwm.set_PWM_frequency( servo, 50 )
-pwm.set_servo_pulsewidth( servo, pen_up_pulse_width )
+pwm.set_servo_pulsewidth( servo, 0 )
 #pwm.gpioDelay( 500 ) # todo not the right pigpio library version?
-current_pen_pulse_width = pen_up_pulse_width
+#current_pen_pulse_width = pen_up_pulse_width
+
+current_step_sleep = 1.0 # something really high so it'll be obvious if this ever isn't set properly later
 
 step_size = 1.0/8 # possible step sizes 1.0, 1.0/2, 1.0/4, 1.0/8
 def set_step_size( new_step_size ):
@@ -179,12 +204,19 @@ ht_live_keyboard_on = False
 ht_penstrokes = []
 ht_penstrokes_processing_thread = False
 ht_penstrokes_processing_thread_stop = False
+ht_penstrokes_mutex = False
 
 ink_refill_routine_enabled_default = False
 ink_refill_routine_enabled = ink_refill_routine_enabled_default
 ink_refill_every_penstroke = False
 ink_refill_every_x = 10
 ink_refill_routine = ""
+
+previous_go_to_angle_ratio = False
+next_go_to_angle_ratio = False
+
+acquire_instructions_from_web_on = False
+stop_acquire_instructions_from_web = False
 
 
 def main():
@@ -233,7 +265,7 @@ def run_ink_refill_routine():
 
 
 def pen_down():
-    global pwm, current_pen_pulse_width, pen_up_pulse_width, pen_down_pulse_width, command_running, pen_up_or_down
+    global pwm, current_pen_pulse_width, pen_up_pulse_width, pen_down_pulse_width, command_running, pen_up_or_down, previous_go_to_angle_ratio, next_go_to_angle_ratio
 
     if pen_up_or_down==True:
         # it's already down
@@ -241,6 +273,8 @@ def pen_down():
 
     command_running = True
     pen_up_or_down = True
+    previous_go_to_angle_ratio = False
+    next_go_to_angle_ratio = False
     print( "> pen down" )
 
     if pen_down_action_time>0:
@@ -265,7 +299,7 @@ def pen_down():
 
 
 def pen_up():
-    global pwm, current_pen_pulse_width, pen_up_pulse_width, pen_down_pulse_width, command_running, pen_up_or_down
+    global pwm, current_pen_pulse_width, pen_up_pulse_width, pen_down_pulse_width, command_running, pen_up_or_down, previous_go_to_angle_ratio, next_go_to_angle_ratio
 
     if pen_up_or_down==False:
         # it's already up
@@ -273,6 +307,8 @@ def pen_up():
 
     command_running = True
     pen_up_or_down = False
+    previous_go_to_angle_ratio = False
+    next_go_to_angle_ratio = False
     print("> pen up")
 
     if pen_up_action_time>0:
@@ -442,6 +478,85 @@ def test_top_stepper():
     command_running = False
 
 
+def acquire_instructions_from_web( url ):
+    global command_running, stop_acquire_instructions_from_web, calibration, acquire_instructions_from_web_on
+    print( "- acquire_instructions_from_web url: " + url )
+    first_response = True
+    loop_with_nothing = 0
+    while not stop_acquire_instructions_from_web:
+        print( "- getting new instructions from: " + url )
+        drew_something = False
+        response = requests.get( url )
+        if response.status_code!=200 and first_response:
+            print( "- error: non 200 response code " + str(response.status_code) )
+            stop_acquire_instructions_from_web = True
+        else:
+            if first_response:
+                first_response = False
+                acquire_instructions_from_web_on = True
+                try:
+                    f = open( "/root/web_instructions_ids_processed.json", "w" )
+                    f.write( json.dumps([]) )
+                    f.close()
+                except:
+                    # oops
+                    print( "- file IO error" )
+            try:
+                f = open( "/root/web_instructions_ids_processed.json", "r" )
+                web_instructions_ids_processed = json.loads( f.read() )
+                f.close()
+            except:
+                    # oops
+                    print( "- file IO error" )
+            pcodes = json.loads( response.text )
+            for pcode in pcodes:
+                if str(pcode['id']) not in web_instructions_ids_processed:
+                    print( "- drawing ID: " + str(pcode['id']) )
+                    draw( pcode['pcode'] )
+                    drew_something = True
+                    web_instructions_ids_processed.append( str(pcode['id']) )
+                    try:
+                        f = open( "/root/web_instructions_ids_processed.json", "w" )
+                        f.write( json.dumps(web_instructions_ids_processed) )
+                        f.close()
+                    except:
+                        # oops
+                        print( "- file IO error" )
+        if not drew_something:
+            loop_with_nothing += 1
+            if loop_with_nothing==1:
+                print( "- moving away from the last drawing" )
+                go_to( random.uniform(10.0, 90.0), random.uniform(10.0, 90.0), True)
+            else:
+                time.sleep( 1 )
+        else:
+            loop_with_nothing = 0
+
+
+def gondola_step_left( steps, step_sleep, direction ):
+    if direction:
+        GPIO.output( stepper_bottom_dir, GPIO.HIGH )
+    else:
+        GPIO.output( stepper_bottom_dir, GPIO.LOW )
+    for i in range( steps ):
+        GPIO.output( stepper_bottom_step, GPIO.HIGH )
+        time.sleep( step_sleep )
+        GPIO.output( stepper_bottom_step, GPIO.LOW )
+        time.sleep( step_sleep )
+
+
+def gondola_step_right( steps, step_sleep, direction ):
+    if direction:
+        GPIO.output( stepper_top_dir, GPIO.HIGH )
+    else:
+        GPIO.output( stepper_top_dir, GPIO.LOW )
+    for i in range( steps ):
+        GPIO.output( stepper_top_step, GPIO.HIGH )
+        time.sleep( step_sleep )
+        GPIO.output( stepper_top_step, GPIO.LOW )
+        time.sleep( step_sleep )
+
+
 def step_down( steps, step_sleep ):
     GPIO.output( stepper_bottom_dir, GPIO.HIGH )
     GPIO.output( stepper_top_dir, GPIO.HIGH )
@@ -551,7 +666,7 @@ def get_potential_errors():
 
 
 def load_variables_from_disk():
-    global default_step_sleep, pen_down_pulse_width, pen_up_pulse_width, pen_down_action_time, pen_up_action_time, pen_down_sleep_before_move_time, pen_up_sleep_before_move_time, acceleration_steps, deceleration_steps, acceleration_slow_steps_sleep, acceleration_fast_steps_sleep, ink_refill_routine_enabled, ink_refill_every_penstroke, ink_refill_every_x, ink_refill_routine
+    global default_step_sleep, pen_down_pulse_width, pen_up_pulse_width, pen_down_action_time, pen_up_action_time, pen_down_sleep_before_move_time, pen_up_sleep_before_move_time, acceleration_steps, deceleration_steps, acceleration_slow_steps_sleep, acceleration_fast_steps_sleep, ink_refill_routine_enabled, ink_refill_every_penstroke, ink_refill_every_x, ink_refill_routine, gondola_steps_per_cm, gondola_reserve_margin, gondola_max_travel
 
     print( "> load_variables_from_disk" )
     # some variables are preserved accross reboots
@@ -577,6 +692,9 @@ def load_variables_from_disk():
         ink_refill_every_penstroke = variables['ink_refill_every_penstroke']
         ink_refill_every_x = variables['ink_refill_every_x']
         ink_refill_routine = variables['ink_refill_routine']
+        gondola_steps_per_cm = variables['gondola_steps_per_cm']
+        gondola_reserve_margin = variables['gondola_reserve_margin']
+        gondola_max_travel = variables['gondola_max_travel']
     except:
         # I guess we'll just keep the defaults
         print( "no variables on disk, must be a first run" )
@@ -584,7 +702,7 @@ def load_variables_from_disk():
 
 
 def save_variables_to_disk():
-    global default_step_sleep, pen_down_pulse_width, pen_up_pulse_width, pen_down_action_time, pen_up_action_time, pen_down_sleep_before_move_time, pen_up_sleep_before_move_time, acceleration_steps, deceleration_steps, acceleration_slow_steps_sleep, acceleration_fast_steps_sleep, ink_refill_routine_enabled, ink_refill_every_penstroke, ink_refill_every_x, ink_refill_routine
+    global default_step_sleep, pen_down_pulse_width, pen_up_pulse_width, pen_down_action_time, pen_up_action_time, pen_down_sleep_before_move_time, pen_up_sleep_before_move_time, acceleration_steps, deceleration_steps, acceleration_slow_steps_sleep, acceleration_fast_steps_sleep, ink_refill_routine_enabled, ink_refill_every_penstroke, ink_refill_every_x, ink_refill_routine, gondola_steps_per_cm, gondola_reserve_margin, gondola_max_travel
 
     print( "> save_variables_to_disk" )
     # some variables are preserved accross reboots
@@ -604,6 +722,9 @@ def save_variables_to_disk():
     variables['ink_refill_every_penstroke'] = ink_refill_every_penstroke
     variables['ink_refill_every_x'] = ink_refill_every_x
     variables['ink_refill_routine'] = ink_refill_routine
+    variables['gondola_steps_per_cm'] = gondola_steps_per_cm
+    variables['gondola_reserve_margin'] = gondola_reserve_margin
+    variables['gondola_max_travel'] = gondola_max_travel
     try:
         f = open( "/root/variables.json", "w" )
         f.write( json.dumps(variables) )
@@ -613,15 +734,29 @@ def save_variables_to_disk():
         pass
 
 
+# taken from https://stackoverflow.com/a/30034847
+def get_split_lines(file_path):
+    with open(file_path, "r") as f:
+        for line in f:
+            yield line
+
+
 def draw( turtle_code ):
-    global command_running, pause_draw, pen_up_or_down, stop_draw, ink_refill_routine_enabled, ink_refill_every_x, ink_refill_every_penstroke, draw_going
+    global command_running, pause_draw, pen_up_or_down, stop_draw, ink_refill_routine_enabled, ink_refill_every_x, ink_refill_every_penstroke, draw_going, current_step_sleep
 
     command_running = True
     draw_going = True
     print("> draw")
-    turtle_code = turtle_code.replace( " ", "" )
-    turtle_code = turtle_code.lower()
-    turtle_code = turtle_code.split( "\n" )
+
+    if turtle_code=="file":
+        turtle_code = list( get_split_lines("/data/tcode") )
+        for i in range(len(turtle_code)):
+            turtle_code[i] = turtle_code[i].replace( " ", "" )
+            turtle_code[i] = turtle_code[i].lower()
+    else:
+        turtle_code = turtle_code.replace( " ", "" )
+        turtle_code = turtle_code.lower()
+        turtle_code = turtle_code.split( "\n" )
 
     shift_by_x = 0.0
     shift_by_y = 0.0
@@ -696,6 +831,9 @@ def draw( turtle_code ):
     previous_y = current_y
     ink_refill_traveled_distance_since_last_refill = 0
 
+    steps = []
+    current_step_sleep = acceleration_slow_steps_sleep
+    pen_down_after_processing = False
     for i in range(len(turtle_code)):
         line = turtle_code[i]
         if pause_draw:
@@ -730,15 +868,50 @@ def draw( turtle_code ):
                     ink_refill_traveled_distance_since_last_refill += math.sqrt( (to_x-previous_x)**2 + (to_y-previous_y)**2 )
                     previous_x = to_x
                     previous_y = to_y
-                    go_to( to_x, to_y )
+                    next_x = False
+                    next_y = False
+                    # trying to find next_x and next_y to refine acceleration based on angle
+                    # disabled for now
+                    # for j in range( i+1, len(turtle_code) ):
+                    #     potential_line = turtle_code[j]
+                    #     potential_line = potential_line.split( "(" )
+                    #     if len(potential_line)==2:
+                    #         potential_command = potential_line[0]
+                    #         potential_params = potential_line[1].replace( ")", "" ).split( "," )
+                    #         if potential_command=="go_to" and len(potential_params)==2:
+                    #             potential_to_x = (float(potential_params[0])) * ratio
+                    #             potential_to_y = (float(potential_params[1])) * ratio
+                    #             if potential_to_x<0.0 or potential_to_x>canvas_max_x or potential_to_y<0.0 or potential_to_y>canvas_max_y:
+                    #                 print(">   WARNING: potential next out of bound " + str(potential_to_x) + "," + str(potential_to_y))
+                    #             else:
+                    #                 next_x = potential_to_x
+                    #                 next_y = potential_to_y
+                    #                 break
+                    #         elif command=="pen_up":
+                    #             break
+                    #         elif command=="pen_down":
+                    #             break
+                    steps += go_to( to_x, to_y, False, pen_down_after_processing, next_x, next_y )
             elif command=="pen_up":
+                if pen_down_after_processing:
+                    pen_down_after_processing = False
+                    pen_down()
+                gondola_actuate( steps )
                 pen_up()
                 if ink_refill_routine_enabled and i<(len(turtle_code)-1) and ink_refill_traveled_distance_since_last_refill>0:
                     if ink_refill_every_penstroke or ink_refill_traveled_distance_since_last_refill>=ink_refill_every_x:
                         ink_refill_traveled_distance_since_last_refill = 0
                         run_ink_refill_routine()
             elif command=="pen_down":
-                pen_down()
+                if pen_down_after_processing is not True:
+                    gondola_actuate( steps )
+                    pen_down_after_processing = True
+                    print( "> will pen down after processing stroke to come" )
+                else:
+                    print( "> extraneous pen down" )
+                # pen_down()
+            elif command=="pause":
+                pause_draw = True
             else:
                 print(">   WARNING: can't parse line: " + orig_line)
         if stop_draw:
@@ -746,16 +919,363 @@ def draw( turtle_code ):
             pause_draw = False
             break ;
 
+    if pen_down_after_processing:
+            pen_down_after_processing = False
+            pen_down()
+    gondola_actuate( steps )
+
     # getting out of the way
     if pen_up_or_down:
         pen_up()
-    go_to( 10, canvas_max_y-10 )
+
+    if get_out_of_the_way_after_draw:
+        get_out_of_the_way_x = min_x - 10
+        get_out_of_the_way_y = max_y + 10
+        if get_out_of_the_way_x<10.0 or get_out_of_the_way_x>(canvas_max_x-10.0) or get_out_of_the_way_y<10.0 or get_out_of_the_way_y>(canvas_max_y-10.0):
+            get_out_of_the_way_x = 10.0
+            get_out_of_the_way_y = canvas_max_y - 10
+        go_to( get_out_of_the_way_x, get_out_of_the_way_y )
+
     command_running = False
     draw_going = False
 
 
-def go_to( x, y ):
-    global current_x, current_y, x_steps_skew, y_steps_skew, command_running
+def gondola_get_l( x, y ):
+    return math.sqrt( math.pow(x, 2) + math.pow(100-y, 2) )
+
+
+def gondola_get_r( x, y ):
+    return math.sqrt( math.pow(100-x, 2) + math.pow(100-y, 2) )
+
+
+def gondola_get_l_diff( x_origin, y_origin, x_destination, y_destination ):
+    return gondola_get_l( x_destination, y_destination ) - gondola_get_l( x_origin, y_origin )
+
+
+def gondola_get_r_diff( x_origin, y_origin, x_destination, y_destination ):
+    return gondola_get_r( x_destination, y_destination ) - gondola_get_r( x_origin, y_origin )
+
+
+def gondola_units_to_steps( units ):
+    return units * (gondola_calibration_length/100) * gondola_steps_per_cm
+
+
+def gondola_go_to( x, y, depth=0, acceleration=True, deceleration=True, actuate=True, gondola_travel_break=False, next_x=False, next_y=False ):
+    global current_x, current_y, x_steps_skew, y_steps_skew, command_running, previous_go_to_angle_ratio, next_go_to_angle_ratio, current_step_sleep
+
+    command_running = True
+    if depth==0:
+        print( "> gondola_go_to( " + str(x) + ", " + str(y) + " )" )
+    x_orig = x
+    y_orig = y
+    reserve_margin_ratio = (100.0-2*gondola_reserve_margin)/100.0
+    x = x * reserve_margin_ratio + gondola_reserve_margin
+    y = y * reserve_margin_ratio + gondola_reserve_margin
+    if depth==0:
+        print( ">   including reserved margins: ( " + str(x) + ", " + str(y) + " )" )
+    else:
+        print( ">       ( " + str(x) + ", " + str(y) + " )" )
+    if gondola_travel_break:
+        # https://math.stackexchange.com/questions/153238/finding-a-point-on-the-line-joining-two-points-in-cartesian-coordinate-system
+        gondola_distance = math.sqrt( (x-current_x)**2 + (y-current_y)**2 )
+        if depth==0 and gondola_distance>gondola_max_travel:
+            print( ">     travel break with distance: " + str(gondola_distance) + " greater than: " + str(gondola_max_travel) )
+        if gondola_distance>gondola_max_travel and abs(gondola_distance-gondola_max_travel)>0.0000001: # removes rounding errors
+            alpha = gondola_max_travel / gondola_distance
+            new_x = current_x + alpha * ( x - current_x )
+            new_y = current_y + alpha * ( y - current_y )
+            new_x = ( new_x - gondola_reserve_margin ) / reserve_margin_ratio
+            new_y = ( new_y - gondola_reserve_margin ) / reserve_margin_ratio
+            if depth==0:
+                return gondola_go_to( new_x, new_y, depth+1, True, False, actuate, gondola_travel_break ) + gondola_go_to( x_orig, y_orig, depth+1, False, True, actuate, gondola_travel_break )
+            else:
+                return gondola_go_to( new_x, new_y, depth+1, False, False, actuate, gondola_travel_break ) + gondola_go_to( x_orig, y_orig, depth+1, False, True, actuate, gondola_travel_break )
+
+    l_steps = gondola_units_to_steps( gondola_get_l_diff(current_x, current_y, x, y) ) - x_steps_skew
+    r_steps = gondola_units_to_steps( gondola_get_r_diff(current_x, current_y, x, y) ) - y_steps_skew
+
+    x_steps_skew = round( l_steps ) - l_steps
+    y_steps_skew = round( r_steps ) - r_steps
+
+    l_steps = int( round(l_steps) )
+    r_steps = int( round(r_steps) )
+
+    l_direction = False
+    if l_steps<0:
+        l_direction = True
+        l_steps = abs( l_steps )
+    r_direction = True
+    if r_steps<0:
+        r_direction = False
+        r_steps = abs( r_steps )
+    steps_to_take = [] ;
+    # for i in range( l_steps ):
+    #     steps_to_take.append( False )
+    # for i in range( r_steps ):
+    #     steps_to_take.append( True )
+    # random.shuffle( steps_to_take )
+    # method 3
+    if l_steps==0:
+        for i in range(r_steps):
+            steps_to_take.append( [True, acceleration_fast_steps_sleep, r_direction] )
+    elif r_steps==0:
+        for i in range(l_steps):
+            steps_to_take.append( [False, acceleration_fast_steps_sleep, l_direction] )
+    elif l_steps==r_steps:
+        for i in range(l_steps):
+            steps_to_take.append( [False, acceleration_fast_steps_sleep, l_direction] )
+            steps_to_take.append( [True, acceleration_fast_steps_sleep, r_direction] )
+    elif l_steps>r_steps:
+        for i in range(l_steps):
+            steps_to_take.append( [False, acceleration_fast_steps_sleep, l_direction] )
+        r_remaining = r_steps
+        while (l_steps+r_steps)-len(steps_to_take)>0:
+            every_nth = math.ceil( float(len(steps_to_take)) / float(r_remaining) )
+            every_nth = int( every_nth ) ;
+            new_steps_to_take = []
+            for i in range( len(steps_to_take) ):
+                new_steps_to_take.append( steps_to_take[i] )
+                if (i+1)%every_nth==0 and r_remaining>0:
+                    new_steps_to_take.append( [True, acceleration_fast_steps_sleep, r_direction] )
+                    r_remaining = r_remaining - 1
+            steps_to_take = new_steps_to_take
+    else: # r_steps>l_steps
+        for i in range(r_steps):
+            steps_to_take.append( [True, acceleration_fast_steps_sleep, r_direction] )
+        l_remaining = l_steps
+        while (l_steps+r_steps)-len(steps_to_take)>0:
+            every_nth = math.ceil( float(len(steps_to_take)) / float(l_remaining) )
+            every_nth = int( every_nth )
+            new_steps_to_take = []
+            for i in range( len(steps_to_take) ):
+                new_steps_to_take.append( steps_to_take[i] )
+                if (i+1)%every_nth==0 and l_remaining>0:
+                    new_steps_to_take.append( [False, acceleration_fast_steps_sleep, l_direction] )
+                    l_remaining = l_remaining - 1
+            steps_to_take = new_steps_to_take
+
+    # acceleration model
+    if depth==0 and next_x is not False and next_y is not False:
+        next_x = next_x * (100.0-2*gondola_reserve_margin)/100.0 + gondola_reserve_margin
+        next_y = next_y * (100.0-2*gondola_reserve_margin)/100.0 + gondola_reserve_margin
+        print( ">   acceleration angle adjust" )
+        print( ">     current_x: " + str(current_x) )
+        print( ">     current_y: " + str(current_y) )
+        print( ">     x: " + str(x) )
+        print( ">     y: " + str(y) )
+        print( ">     next_x: " + str(next_x) )
+        print( ">     next_y: " + str(next_y) )
+        angle_0 = math.degrees( math.atan2(y-current_y, x-current_x) )
+        angle_1 = math.degrees( math.atan2( next_y-y, next_x-x ) )
+        next_go_to_angle_ratio = abs( ( angle_1 - angle_0 ) / 180.0 )
+        if next_go_to_angle_ratio>1.0:
+            next_go_to_angle_ratio %= 1.0
+            next_go_to_angle_ratio = 1.0 - next_go_to_angle_ratio
+        print( ">       next_go_to_angle_ratio: " + str(next_go_to_angle_ratio) )
+
+    acceleration_step_sleep_delta = (acceleration_fast_steps_sleep - acceleration_slow_steps_sleep) / acceleration_steps
+    deceleration_step_sleep_delta = (acceleration_slow_steps_sleep - acceleration_fast_steps_sleep) / deceleration_steps
+    # print( "acceleration_step_sleep_delta: " + str( acceleration_step_sleep_delta ) )
+    # print( "deceleration_step_sleep_delta: " + str( deceleration_step_sleep_delta ) )
+
+    acceleration_times_to_sleep = []
+    if acceleration:
+        acceleration_from = current_step_sleep
+        acceleration_to = acceleration_fast_steps_sleep
+        i = 0
+        while i<len(steps_to_take) and current_step_sleep>acceleration_fast_steps_sleep:
+            current_step_sleep += acceleration_step_sleep_delta
+            if current_step_sleep<acceleration_fast_steps_sleep:
+                current_step_sleep = acceleration_fast_steps_sleep
+            steps_to_take[i][1] = current_step_sleep
+            i += 1
+
+    if deceleration:
+        deceleration_to = acceleration_slow_steps_sleep
+        if next_go_to_angle_ratio is not False:
+            deceleration_to *= next_go_to_angle_ratio
+        i = len(steps_to_take)-1
+        temp_reverse_current_step_sleep = deceleration_to
+        while i>=0 and temp_reverse_current_step_sleep>steps_to_take[i][1]:
+            steps_to_take[i][1] = temp_reverse_current_step_sleep
+            temp_reverse_current_step_sleep -= deceleration_step_sleep_delta
+            i -= 1
+
+    if len(steps_to_take)>0:
+        current_step_sleep = steps_to_take[len(steps_to_take)-1][1]
+
+
+
+    # for i in range( len(steps_to_take) ):
+    #     print( steps_to_take[i] )
+    # exit( 1 )
+
+
+
+    # acceleration_times_to_sleep = []
+    # acceleration_step_count = 0
+    # if acceleration:
+    #     if previous_go_to_angle_ratio is not False:
+    #         acceleration_step_count = round( acceleration_steps * previous_go_to_angle_ratio )
+    #     else:
+    #         acceleration_step_count = acceleration_steps
+
+    # deceleration_times_to_sleep = []
+    # deceleration_step_count = 0
+    # if deceleration:
+    #     if next_go_to_angle_ratio is not False:
+    #         deceleration_step_count = round( deceleration_steps * next_go_to_angle_ratio )
+    #     else:
+    #         deceleration_step_count = deceleration_steps
+
+    # if acceleration_step_count>0:
+    #     accelerate_from = current_step_sleep
+    #     accelerate_to = acceleration_fast_steps_sleep
+    #     tts_diff = abs( accelerate_from-accelerate_to ) / acceleration_step_count
+    #     if (acceleration_step_count+deceleration_step_count)<=len(steps_to_take):
+    #         # easy
+    #         for i in range( acceleration_step_count ):
+    #             acceleration_times_to_sleep.append( round(accelerate_from-(i+1)*tts_diff, 4) )
+    #             current_step_sleep = acceleration_times_to_sleep[len(acceleration_times_to_sleep)-1]
+    #     else:
+    #         # we can only do a partial acceleration
+    #         for i in range( acceleration_step_count-int((len(steps_to_take)-acceleration_step_count-deceleration_step_count)/2) ):
+    #             acceleration_times_to_sleep.append( round(accelerate_from-(i+1)*tts_diff, 4) )
+    #             current_step_sleep = acceleration_times_to_sleep[len(acceleration_times_to_sleep)-1]
+
+    # if deceleration_step_count>0:
+    #     decelerate_from = current_step_sleep
+    #     decelerate_to = acceleration_slow_steps_sleep + ((acceleration_fast_steps_sleep - acceleration_slow_steps_sleep) * next_go_to_angle_ratio)
+    #     tts_diff = abs( decelerate_from-decelerate_to ) / deceleration_step_count
+    #     if (acceleration_step_count+deceleration_step_count)<=len(steps_to_take):
+    #         # easy
+    #         for i in range( deceleration_step_count ):
+    #             deceleration_times_to_sleep.append( round(decelerate_from+(i+1)*tts_diff, 4) )
+    #             current_step_sleep = deceleration_times_to_sleep[len(deceleration_times_to_sleep)-1]
+    #     else:
+    #         # we can only do a partial acceleration
+    #         for i in range( deceleration_step_count-int((len(steps_to_take)-acceleration_step_count-deceleration_step_count)/2) ):
+    #             deceleration_times_to_sleep.append( round(accelerate_from-(i+1)*tts_diff, 4) )
+    #             current_step_sleep = deceleration_times_to_sleep[len(deceleration_times_to_sleep)-1]
+
+    ###################################################################
+
+    # if acceleration_step_count>0:
+    #     tts_diff = abs( accelerate_from-accelerate_to ) / acceleration_step_count
+    #     for i in range( min(acceleration_step_count, len(steps_to_take)) ):
+    #         acceleration_times_to_sleep.append( round(accelerate_from-(i+1)*tts_diff, 4) )
+    #         cur
+
+
+    # acceleration_times_to_sleep = []
+
+    # effective_acceleration_steps = acceleration_steps
+    # if previous_go_to_angle_ratio is not False:
+    #     acceleration_ratio = previous_go_to_angle_ratio
+    #     effective_acceleration_steps = round( effective_acceleration_steps * acceleration_ratio )
+    #     print( ">         acceleration_ratio: " + str(acceleration_ratio) )
+    # if effective_acceleration_steps>0:
+    #     print( ">         effective_acceleration_steps: " + str(effective_acceleration_steps) )
+    #     tts_diff = abs(current_step_sleep-acceleration_fast_steps_sleep)/effective_acceleration_steps
+    #     for i in range( min(effective_acceleration_steps, len(steps_to_take)) ):
+    #         acceleration_times_to_sleep.append( round(current_step_sleep-(i+1)*tts_diff, 4) )
+    # print( "acceleration_times_to_sleep" )
+    # print( acceleration_times_to_sleep )
+
+    # deceleration_times_to_sleep = []
+    # decelerate_from_sleep = current_step_sleep
+
+    # if len(acceleration_times_to_sleep)>0:
+    #     decelerate_from_sleep = acceleration_times_to_sleep[len(acceleration_times_to_sleep)-1]
+
+    # effective_deceleration_steps = deceleration_steps
+    # if next_go_to_angle_ratio is not False:
+    #     deceleration_ratio = next_go_to_angle_ratio
+    #     effective_deceleration_steps = round( effective_deceleration_steps * deceleration_ratio )
+    #     print( ">         deceleration_ratio: " + str(deceleration_ratio) )
+
+    # if effective_deceleration_steps>0:
+    #     print( ">         effective_deceleration_steps: " + str(effective_deceleration_steps) )
+    #     tts_diff = abs(decelerate_from_sleep-acceleration_slow_steps_sleep)/(min(effective_deceleration_steps, len(steps_to_take))+1)
+    #     for i in range( min(effective_deceleration_steps, len(steps_to_take)) ):
+    #         deceleration_times_to_sleep.append( round(decelerate_from_sleep+(i+1)*tts_diff, 4) )
+    # print( "deceleration_times_to_sleep" )
+    # print( deceleration_times_to_sleep )
+
+    #############################################################################
+
+    # times_to_sleep = []
+    # overlap = len(acceleration_times_to_sleep)+len(deceleration_times_to_sleep)-len(steps_to_take)
+    # j = 0
+    # if overlap<=0:
+    #     # easy peasy
+    #     for i in range( len(acceleration_times_to_sleep) ):
+    #         if acceleration:
+    #             steps_to_take[j][1] = acceleration_times_to_sleep[i]
+    #         else:
+    #             steps_to_take[j][1] = acceleration_fast_steps_sleep
+    #         j += 1
+    #     for i in range( len(steps_to_take)-len(acceleration_times_to_sleep)-len(deceleration_times_to_sleep) ):
+    #         steps_to_take[j][1] = acceleration_fast_steps_sleep
+    #         j += 1
+    #     for i in range( len(deceleration_times_to_sleep) ):
+    #         if deceleration:
+    #             steps_to_take[j][1] = deceleration_times_to_sleep[i]
+    #         else:
+    #             steps_to_take[j][1] = acceleration_fast_steps_sleep
+    #         j += 1
+    # elif overlap>0:
+    #     print( "> error #tywnethe: we should never encounter this case" )
+    #     print( len(steps_to_take) )
+    #     print( len(acceleration_times_to_sleep) )
+    #     print( len(deceleration_times_to_sleep) )
+    #     exit( 1 )
+
+    if actuate:
+        gondola_actuate( steps_to_take )
+    # for i in range( len(steps_to_take) ):
+    #     print( steps_to_take[i] )
+
+    previous_go_to_angle_ratio = next_go_to_angle_ratio
+    next_go_to_angle_ratio = False
+    current_x = x
+    current_y = y
+    command_running = False
+
+    return steps_to_take
+
+
+def gondola_actuate( steps_to_take ):
+    global current_step_sleep
+
+    i = 0
+    while i<len(steps_to_take):
+        if steps_to_take[i][0]==False:
+            # print( "l" )
+            if i<(len(steps_to_take)-1) and steps_to_take[i+1][0]==True:
+                gondola_step_left( 1, 0, steps_to_take[i][2] )
+                gondola_step_right( 1, max(steps_to_take[i][1],steps_to_take[i+1][1]), steps_to_take[i+1][2] )
+                i += 1
+            else:
+                gondola_step_left( 1, steps_to_take[i][1], steps_to_take[i][2] )
+        else:
+            # print( "r" )
+            if i<(len(steps_to_take)-1) and steps_to_take[i+1][0]==False:
+                gondola_step_right( 1, 0, steps_to_take[i][2] )
+                gondola_step_left( 1, max(steps_to_take[i][1],steps_to_take[i+1][1]), steps_to_take[i+1][2] )
+                i += 1
+            else:
+                gondola_step_right( 1, steps_to_take[i][1], steps_to_take[i][2] )
+        i += 1
+    steps_to_take.clear()
+    current_step_sleep = acceleration_slow_steps_sleep
+
+
+def go_to( x, y, actuate=True, gondola_travel_break=False, next_x=False, next_y=False ):
+    global current_x, current_y, x_steps_skew, y_steps_skew, command_running, gondola
+
+    if gondola:
+        return gondola_go_to( x, y, 0, True, True, actuate, gondola_travel_break, next_x, next_y )
 
     command_running = True
     print( "> go_to( " + str(x) + ", " + str(y) + " )" )
@@ -772,8 +1292,8 @@ def go_to( x, y ):
     x_steps_skew = round( x_steps ) - x_steps
     y_steps_skew = round( y_steps ) - y_steps
 
-    x_steps = int( round(x_steps) ) ;
-    y_steps = int( round(y_steps) ) ;
+    x_steps = int( round(x_steps) )
+    y_steps = int( round(y_steps) )
 
     steps_to_take = []
     horizontal = 6
@@ -861,6 +1381,15 @@ def go_to( x, y ):
         for i in range( overlap_cutoff, len(deceleration_times_to_sleep) ):
             times_to_sleep.append( deceleration_times_to_sleep[i] )
 
+    if actuate:
+        tabletop_actuate( steps_to_take )
+
+    current_x = x
+    current_y = y
+    command_running = False
+
+
+def tabletop_actuate( steps_to_take ):
     for i in range(len(steps_to_take)):
         if steps_to_take[i]==8:
             step_down( 1, times_to_sleep[i] )
@@ -874,10 +1403,6 @@ def go_to( x, y ):
             print("> error #epwiroj948o: what in the heck are we doing here?")
             exit( 1 )
 
-    current_x = x
-    current_y = y
-    command_running = False
-
 
 def calibrate_manually():
     global canvas_max_x_steps, canvas_max_y_steps, canvas_max_x, canvas_max_y, current_x, current_y, calibration_ongoing, calibration_done, command_running
@@ -886,6 +1411,17 @@ def calibrate_manually():
 
     command_running = True
     print("> calibrate_manually")
+
+    if gondola:
+        canvas_max_x = 100.0
+        canvas_max_y = 100.0
+        current_x = 50.0
+        current_y = 50.0
+        print(">   head assumed to be currently at " + str(current_x) + "," + str(current_y))
+        calibration_ongoing = False
+        calibration_done = True
+        command_running = False
+        return
 
     calibration_done = False
     calibrate_manually_down_reached = False
@@ -1249,16 +1785,21 @@ def command_server():
     global mg_penstrokes_processing_thread, mg_penstrokes_processing_thread_stop, mg_link_session_id, mg_link_socket
     global ink_refill_routine_enabled, ink_refill_routine, ink_refill_every_penstroke, ink_refill_every_x
     global pen_down_pulse_width, pen_up_pulse_width, pen_down_action_time, pen_up_action_time, pen_down_sleep_before_move_time, pen_up_sleep_before_move_time, acceleration_steps, deceleration_steps, acceleration_slow_steps_sleep, acceleration_fast_steps_sleep, default_step_sleep
-    global ht_live_keyboard_on
+    global ht_live_keyboard_on, ht_penstrokes, ht_penstrokes_mutex, ht_penstrokes_processing_thread_stop, ht_penstrokes_processing_thread
+    global acquire_instructions_from_web_on, stop_acquire_instructions_from_web
+    global gondola_steps_per_cm, gondola_reserve_margin, gondola_max_travel, gondola_calibration_length
+
+    pen_up()
 
     command_server_server = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
+    command_server_server.setsockopt( socket.SOL_SOCKET, socket.SO_REUSEADDR, 1 )
     command_server_server.bind( (command_server_address, command_server_port) )
     command_server_server.listen()
     print( "# command server started waiting for connections" )
     while True and not clean_up_before_exit:
         command_server_client, address = command_server_server.accept()
         # we only accept 1 command per connection
-        buf = command_server_client.recv( 64 )
+        buf = command_server_client.recv( 256 )
         buf = buf.strip().decode("utf-8") ;
         if len( buf )>0:
             if buf=="calibrate_automatic":
@@ -1319,7 +1860,7 @@ def command_server():
                 print( "# update_ink_refill_routine" )
                 command_server_client.sendall( b"ok" )
                 command_server_client.close()
-                f = open("/data/ink_refill_routine", "r")
+                f = open( "/data/ink_refill_routine", "r" )
                 ink_refill_routine = f.read()
                 print( ink_refill_routine )
                 f.close()
@@ -1338,9 +1879,10 @@ def command_server():
                     else:
                         command_server_client.sendall( b"ok" )
                         command_server_client.close()
-                        f = open("/data/tcode", "r")
-                        tcode = f.read()
-                        f.close()
+                        # f = open( "/data/tcode", "r" )
+                        # tcode = f.read()
+                        # f.close()
+                        tcode = "file"
                         draw_thread = threading.Thread( target=draw, args=[tcode] )
                         draw_thread.start()
                         #draw( tcode )
@@ -1568,6 +2110,50 @@ def command_server():
                     command_server_client.sendall( b"invalid" )
                 command_server_client.close()
                 save_variables_to_disk()
+            elif buf.startswith("gondola_steps_per_cm("):
+                print( buf )
+                print( "# gondola_steps_per_cm" )
+                value = int( buf.split( "(" )[1].replace( ")", "" ).strip() ) ;
+                if type(value)==int:
+                    gondola_steps_per_cm = value
+                    command_server_client.sendall( b"ok" )
+                else:
+                    command_server_client.sendall( b"invalid" )
+                command_server_client.close()
+                save_variables_to_disk()
+            elif buf.startswith("gondola_reserve_margin("):
+                print( buf )
+                print( "# gondola_reserve_margin" )
+                value = float( buf.split( "(" )[1].replace( ")", "" ).strip() ) ;
+                if type(value)==float:
+                    gondola_reserve_margin = value
+                    command_server_client.sendall( b"ok" )
+                else:
+                    command_server_client.sendall( b"invalid" )
+                command_server_client.close()
+                save_variables_to_disk()
+            elif buf.startswith("gondola_max_travel("):
+                print( buf )
+                print( "# gondola_max_travel" )
+                value = float( buf.split( "(" )[1].replace( ")", "" ).strip() ) ;
+                if type(value)==float:
+                    gondola_max_travel = value
+                    command_server_client.sendall( b"ok" )
+                else:
+                    command_server_client.sendall( b"invalid" )
+                command_server_client.close()
+                save_variables_to_disk()
+            elif buf.startswith("gondola_calibrate("):
+                gondola_motor_distance = buf.split( "(" )[1].replace(")", "").strip()
+                try:
+                    f = open( "/var/gondola_motor_distance", "w" )
+                    f.write( gondola_motor_distance )
+                    f.close()
+                except:
+                    # oops
+                    print( "- file IO error" )
+                gondola_calibration_length = float( gondola_motor_distance )
+                calibrate_manually()
             elif buf.startswith("connect_to_mg_session("):
                 mg_link_session_id = buf.split( "(" )[1].replace(")", "").strip()
 
@@ -1650,6 +2236,7 @@ def command_server():
                 print( "# ht_live_keyboard_on" )
                 ht_live_keyboard_on = True
                 ht_penstrokes = []
+                ht_penstrokes_mutex = False
                 ht_penstrokes_processing_thread_stop = False
                 ht_penstrokes_processing_thread = threading.Thread( target=ht_penstrokes_processing )
                 ht_penstrokes_processing_thread.start()
@@ -1672,7 +2259,7 @@ def command_server():
                 command_server_client.close()
             elif buf=="add_to_ht_penstrokes":
                 print( "# add_to_ht_penstrokes" )
-                f = open("/data/add_to_ht_penstrokes", "r")
+                f = open( "/data/add_to_ht_penstrokes", "r" )
                 new_pcode = f.read()
                 f.close()
                 add_to_ht_penstrokes( new_pcode )
@@ -1699,11 +2286,15 @@ def command_server():
                 status['ink_refill_every_penstroke'] = ink_refill_every_penstroke
                 status['ink_refill_every_x'] = ink_refill_every_x
                 status['ink_refill_routine'] = ink_refill_routine
+                status['gondola_steps_per_cm'] = gondola_steps_per_cm
+                status['gondola_reserve_margin'] = gondola_reserve_margin
+                status['gondola_max_travel'] = gondola_max_travel
                 status['ht_live_keyboard_on'] = ht_live_keyboard_on
-                status['limit_switch_bottom_on'] = limit_switch_bottom_on() ;
-                status['limit_switch_top_on'] = limit_switch_top_on() ;
-                status['limit_switch_left_on'] = limit_switch_left_on() ;
-                status['limit_switch_right_on'] = limit_switch_right_on() ;
+                status['acquire_instructions_from_web_on'] = acquire_instructions_from_web_on
+                status['limit_switch_bottom_on'] = limit_switch_bottom_on()
+                status['limit_switch_top_on'] = limit_switch_top_on()
+                status['limit_switch_left_on'] = limit_switch_left_on()
+                status['limit_switch_right_on'] = limit_switch_right_on()
                 status['error'] = get_potential_errors() ;
                 command_server_client.sendall( json.dumps(status).encode() )
                 command_server_client.close()
@@ -1743,6 +2334,23 @@ def command_server():
                     command_server_client.close()
                     test_top_stepper_thread = threading.Thread( target=test_top_stepper )
                     test_top_stepper_thread.start()
+            elif buf.startswith("acquire_instructions_from_web("):
+                print( "- acquire_instructions_from_web" )
+                if not calibration_done:
+                    print( "-   calibration needed" )
+                    command_server_client.sendall( b"calibration_needed" )
+                    command_server_client.close()
+                else:
+                    command_server_client.sendall( b"ok" )
+                    command_server_client.close()
+                    stop_acquire_instructions_from_web = False
+                    url = buf.split( "(" )[1].replace(")", "").strip()
+                    acquire_instructions_from_web_thread = threading.Thread( target=acquire_instructions_from_web, args=[url] )
+                    acquire_instructions_from_web_thread.start()
+            elif buf.startswith("stop_acquire_instructions_from_web"):
+                print( "- stop_acquire_instructions_from_web" )
+                stop_acquire_instructions_from_web = True
+                acquire_instructions_from_web_on = False
             else:
                 print(( "# error: unknown command: " + str(buf.strip()) ))
 
@@ -1805,8 +2413,12 @@ def mg_penstrokes_processing():
 
 
 def add_to_ht_penstrokes( new_pcode ):
-    global ht_penstrokes
+    global ht_penstrokes, ht_penstrokes_mutex
+    while ht_penstrokes_mutex==True:
+        time.sleep( 0.05 )
+    ht_penstrokes_mutex = True
     ht_penstrokes.append( new_pcode )
+    ht_penstrokes_mutex = False
 
 
 def ht_penstrokes_processing():
@@ -1816,7 +2428,11 @@ def ht_penstrokes_processing():
 
     while True:
         if len(ht_penstrokes)>0:
+            while ht_penstrokes_mutex==True:
+                time.sleep( 0.05 )
+            ht_penstrokes_mutex = True
             instructions = ht_penstrokes.pop( 0 )
+            ht_penstrokes_mutex = False
             for line in instructions.split( "\n" ):
                 orig_line = line
                 #print line
