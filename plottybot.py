@@ -1,7 +1,9 @@
 #!/usr/bin/python3
-import RPi.GPIO as GPIO
+#import RPi.GPIO as GPIO
+import FakeGPIO
 import math
-import pigpio
+#import pigpio
+import FakePigpio
 import random
 import socket
 import threading
@@ -9,6 +11,9 @@ import time
 import sys
 import json
 import socketio
+
+GPIO = FakeGPIO.FakeGPIO()
+pigpio = FakePigpio.FakePigpio()
 
 stepper_bottom_enable = 26
 stepper_bottom_step = 19
